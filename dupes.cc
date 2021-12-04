@@ -17,9 +17,11 @@
 #include <cassert>
 #include <cmath>
 #include <cwchar>   // wchar_t type
+#include <cctype>
 #include <fcntl.h>  // tty console control
 #include <unistd.h> // isatty function
 
+// #include <codecvt>
 #include <iomanip>
 #include <iostream>
 #include <locale>
@@ -32,11 +34,13 @@
 // #include <ranges>   // not available in c++17
 #include <unordered_map>
 #include <utility>
+#include <set>
 #include <vector>
 
 #include <algorithm>
 #include <chrono>
 #include <limits>
+#include <regex>
 #include <typeinfo>
 #include <bits/basic_string.h>
 #include <experimental/filesystem>
@@ -130,6 +134,7 @@ template <typename ...ARGS> void eprint(const char arg[], ARGS... args) {
     char buffer[1024];
     std::snprintf(buffer, sizeof(buffer), arg, args...);
     std::cerr << buffer;
+    // can be replaced with a buffered clog output
 }
 
 /* *************************************************************** */
@@ -186,6 +191,7 @@ struct _opt_st_ {
 enum class opt {
     help = 1,
     // boolean option
+    summarize,
     abspath, delete_, human, noempty, nohidden, quiet,
     recursive, sameline, size_show, symlink, verbose, unix_,
     // long (numeric) options
@@ -202,7 +208,6 @@ std::map<opts::opt, struct _opt_st_<std::vector<std::string>>> lists;
 
 /* *************************************************************** */
 void init() {
-    // helps[helpmsg] = { 'H', "help", "a help message", "value string", "help" };
     helps[opt::help] = { 'H', "help", "a help message",
                 "USAGE:\t\tdupes [-options] DUPES_DIRECTORY\n",
 
@@ -219,7 +224,6 @@ void init() {
     bools[opt::abspath] = { 'a', "absolute", "print an absolute path to file", false,
                 "prints an absolute path to the duplicate file instead\n\t\t"
                 "of a relative path to file that is used by default" };
-    // bools[opt::delete_] is missing
     bools[opt::delete_] = { 'd', "delete", "promt a user which file to keep", false,
                 "promts a user to select which files to keep after\n\t\t"
                 "a program finds all the duplicate files;\n\t\t"
@@ -252,6 +256,9 @@ void init() {
                 "prints a filesize for a group of dupes during output;\n\t\t"
                 "if a --sameline option is specified will print a filesize\n\t\t"
                 "on the same line with a group of dupes, which can ease sorting" };
+    bools[opt::summarize] = { 'm', "summarize", "show search summary", false,
+                "will only print a summary information upon execution;\n\t\t"
+                "a summary info might be muted by a --queit option" };
     bools[opt::symlink] = { 's', "symlink", "try to follow symlinks", false,
                 "if enabled will try to follow an encountered symlink\n\t\t"
                 "and process the file as normal, even if a symlink\n\t\t"
@@ -294,6 +301,7 @@ bool quiet() { return opts::bools.at(opts::opt::quiet).val; }
 bool recursive() { return opts::bools.at(opts::opt::recursive).val; }
 bool sameline() { return opts::bools.at(opts::opt::sameline).val; }
 bool symlink() { return opts::bools.at(opts::opt::symlink).val; }
+bool summary() { return opts::bools.at(opts::opt::summarize).val; }
 bool size_show() { return opts::bools.at(opts::opt::size_show).val; }
 bool unix() { return opts::bools.at(opts::opt::unix_).val; }
 bool verbose() { return !quiet() && opts::bools.at(opts::opt::verbose).val; }
@@ -314,27 +322,23 @@ void _print_help() {
     };
     
     _print_separator('*', 72);
-    // std::cerr << opts::helps.at(opts::helpmsg).val;
     util::eprint(opts::helps.at(opts::opt::help).val.c_str());
     _print_separator('*', 72);
     
     for (const auto &[k,v] : opts::bools)
         util::eprint("-%c, --%s\t%s\n\n", v.ckey, v.skey.c_str(), v.help.c_str());
-        // std::cerr << "-" << v.ckey << ", --" << v.skey << "\t" << v.help << "\n\n";
     for (const auto &[k,v] : opts::longs)
         util::eprint("-%c, --%s\t%s\n\n", v.ckey, v.skey.c_str(), v.help.c_str());
-        // std::cerr << "-" << v.ckey << ", --" << v.skey << "\t" << v.help << "\n\n";
     for (const auto &[k,v] : opts::lists)
         util::eprint("-%c, --%s\t%s\n\n", v.ckey, v.skey.c_str(), v.help.c_str());
-        // std::cerr << "-" << v.ckey << ", --" << v.skey << "\t" << v.help << "\n\n";
     
     _print_separator('*', 72);
-    // std::cerr << opts::helps.at(opts::helpmsg).help;
     util::eprint(opts::helps.at(opts::opt::help).help.c_str());
     _print_separator('*', 72);
     
     // abruptly finish the program execution
-    std::exit((check::unix())? std::abs(ERR_HELPMSG_CALLED) : ERR_HELPMSG_CALLED);
+    int reason = ERR_HELPMSG_CALLED;
+    std::exit((check::unix())? std::abs(reason) : reason);
 }
 
 };  // util
@@ -360,7 +364,7 @@ bool find_opt_help(const std::string &opt) {
     auto [flag,key] = _getopt(opt);
     const auto v = helps.at(opt::help);
     if ( (flag && (v.skey == key)) || (!flag && (v.ckey == key[0])) ) {
-        util::vprint("help option found, exiting!\n");
+        util::vprint("%s option found, exiting!\n", v.desc.c_str());
         return true;
     }
     return false;
@@ -373,20 +377,16 @@ void find_opt_bool(const bool flag, std::string key) {
         if ( (flag && (v.skey == key)) || (!flag && (v.ckey == key[0])) ) {
             v.check = true;
             v.val = true;
-            util::vprint("bool option [%s] found!\n", \
-                    ((flag)? key : key.substr(0, 1)).c_str() );
-                    // TODO: print desc here
+            util::vprint("found option [%s]: %s\n", \
+                    ((flag)? key : key.substr(0, 1)).c_str(), v.desc.c_str() );
             return;
         }
     }
 }
 
-// bool find_opt_long(const std::string &opt, const std::string &next) {
 bool find_opt_long(const bool flag, std::string key, const std::string &next) {
-    // auto [flag,key] = _getopt(opt);
     for (auto &[k,v] : longs) {
         if ( (flag && (v.skey == key)) || (!flag && (v.ckey == key[0])) ) {
-//            v.val = std::abs(std::floor(std::stod(next)));
             try {
                 v.check = true;
                 v.val = std::abs(std::round(std::stod(next)));
@@ -396,8 +396,9 @@ bool find_opt_long(const bool flag, std::string key, const std::string &next) {
                 int res = ERR_ARG_INCORRECT;
                 std::exit((check::unix())? std::abs(res) : res);
             }
-            util::vprint("long option [%s:%llu] found\n", \
-                    ((flag)? key : key.substr(0, 1)).c_str(), v.val);
+            util::vprint("found option [%s:%llu]: %s\n", \
+                    ((flag)? key : key.substr(0, 1)).c_str(),
+                    v.val, v.desc.c_str());
             return true;
         }
     }
@@ -420,8 +421,9 @@ bool find_opt_list(const bool flag, std::string key, const std::string &next) {
             std::string str;
             while (getline(ss, str, ',')) {
                 v.val.push_back(str);
-                util::vprint("list option [%s:%s] found\n", \
-                        ((flag)? key : key.substr(0,1)).c_str(), str.c_str());
+                util::vprint("found option [%s:%s]: %s\n", \
+                        ((flag)? key : key.substr(0,1)).c_str(),
+                        str.c_str(), v.desc.c_str());
             }
             return true;
         }
@@ -443,10 +445,10 @@ void parse_opts(int &pos, const int argc, char *argv[]) {
             find_opt_bool(flag, opt);
             if (pos < (argc - 1)) { // check that we do not fall off
                 std::string next = argv[pos + 1];
-                if (find_opt_long(flag, opt, next)) pos++;  // step over a value
-                if (find_opt_list(flag, opt, next)) pos++;  // step over a value            
+                if (find_opt_long(flag, opt, next)) pos++;
+                if (find_opt_list(flag, opt, next)) pos++;
             }
-            if (flag) continue; // only 1 pass for long key
+            if (flag) continue;     // only 1 pass for a long key
         }
     }
 }
@@ -457,8 +459,18 @@ void parse_dirs(int &pos, const int argc, char *argv[]) {
         if ((opt[0] == '\'') || (opt[0] == '\"')) {
             opt = opt.substr(1, opt.size() - 2);
         }
-        dirs.push_back(opt);
-        util::vprint("<< entry [%s] added\n", opt.c_str());
+        bool unique = true;
+        for (const auto &s : dirs) {
+            if (s == opt) {
+                util::vprint("same entry [%s] found\n", opt.c_str());
+                unique = false;
+                break;
+            }
+        }
+        if (unique) {
+            dirs.push_back(opt);
+            util::vprint("<< entry [%s] added\n", opt.c_str());
+        }
     }
 }
 
@@ -579,21 +591,31 @@ struct count_t {
 
 /* *************************************************************** */
 void _pputs(const char *name, uint64_t &a, uint64_t &b, uint64_t &c) {
-    util::print("%s.. [%s out of %s] files occupying %s bytes\r",
+    util::print("%s.. [%s out of %s] files occupying %s bytes%24s",
             name, (check::human())? util::xdivn(a, 1024).c_str() \
                     : std::to_string(a).c_str(), \
             (check::human())? util::xdivn(b, 1024).c_str() \
                     : std::to_string(b).c_str(),
             (check::human())? util::xdivn(c, 1024).c_str() \
-                    : std::to_string(c).c_str());
+                    : std::to_string(c).c_str(), "\r");
 }
 
 void _rputs(const char *name, uint64_t a, uint64_t b) {
-    util::print(">> %s: %s files occupying %s bytes%28s\n",
+    util::print(">> %s: %s files occupying %s bytes%24s\n",
             name, (check::human())? util::xdivn(a,1024).c_str() \
                     : std::to_string(a).c_str(), \
             (check::human())? util::xdivn(b,1024).c_str() \
                     : std::to_string(b).c_str(), "");
+}
+
+using hrclock = std::chrono::high_resolution_clock;
+void _print_timespent(std::chrono::time_point<hrclock> tstart) {
+    if (check::quiet()) return;
+    
+    auto t2 = hrclock::now();
+    // auto int_ms = duration_cast<std::chrono::milliseconds> (t2 - tstart);
+    std::chrono::duration<double, std::ratio<1, 1>> fp_ms = t2 - tstart;
+    util::print("spent %3.3f seconds processing\n", fp_ms.count());
 }
 
 /* *************************************************************** */
@@ -674,112 +696,143 @@ void filter(const filemap_t<std::pair<size_t, uint64_t>> &byhash,
 }
 
 /* *************************************************************** */
-using hrclock = std::chrono::high_resolution_clock;
-void _print_timespent(std::chrono::time_point<hrclock> tstart) {
-    if (check::quiet()) return;
+std::set<int> prompt_process(const std::string &s, const int maxlen) {
+    std::set<int> list;
+    if ((s.size() < 1) || (maxlen < 1)) return list;
     
-    auto t2 = hrclock::now();
-    // auto int_ms = duration_cast<std::chrono::milliseconds> (t2 - tstart);
-    std::chrono::duration<double, std::ratio<1, 1>> fp_ms = t2 - tstart;
-    util::print("spent %3.3f seconds processing\n", fp_ms.count());
+    std::string cut = "";
+    std::string vs = "0123456789";
+    for (const auto c : s) {
+        if (std::any_of(vs.begin(), vs.end(), [c](char v){ return c == v; })) {
+            cut.push_back(c);      // appends a digit
+        } else {
+            cut.push_back(' ');    // empty space
+        }
+    }
+    
+    // append digits into a set
+    if (s.find("none") != std::string::npos) {
+        // fall through to the very end
+    } else if (s.find("all") != std::string::npos) {
+        for (int i = 1; i <= maxlen; i++) list.insert(i);
+    } else {
+        // std::string cut = s;
+        for (size_t p = 0; p != cut.size(); ) {
+            cut = cut.substr(p, cut.size());
+            const int i = std::abs(std::stoi(cut, &p));
+            if ((i > 0) && (i <= maxlen)) list.insert(i);
+        }
+    }
+    return list;
 }
 
-void _print_res_file() {
-    // normal utf8 output to a file
-    for (const auto &[k,vals] : byfinal2) {
-        const uint64_t flen = k.first, fhash = k.second;
-        if ((fhash == 0) && (flen != 0)) continue;   // ignore invalid hash
-        if (check::size_show()) {
-            if (!check::human()) {
-                util::wprint("%s", std::to_string(flen).c_str());
-            } else {
-                util::wprint("%s", util::xdivn(flen, 1024).c_str());
-            }
-            util::wprint("%s", (check::sameline())? " " : "\n");
-        }
-        for (const auto &p : vals) {
-            util::wprint(((check::abspath())? fs::canonical(p) : p).c_str());
-            util::wprint("%s", (check::sameline())? " " : "\n");
-        }
+std::set<int> prompt_invert(const std::set<int> &input, const int maxlen) {
+    std::set<int> out;
+    for (int i = 1; i <= maxlen; i++) {
+        if (input.find(i) == input.end()) out.insert(i);
+    }
+    return out;
+}
+
+void prompt_delete(const std::vector<fs::path> &vals) {
+    if (!isatty(fileno(stdout))) return;
+    if (!check::delete_()) return;
+    if (vals.size() < 2) return;
+
+    std::string si;
+    util::wprint("Choose which files to keep (all/1/2,3/none):\n");
+    // std::cin.ignore(std::numeric_limits<std::streamsize>::max(), '\n');
+    std::getline(std::cin, si);
+    auto vi = prompt_process(si, vals.size());
+    vi = prompt_invert(vi, vals.size());
+    for (int v : vi) {
+        util::wprint("removing [%d] ", v);
+        util::wprint(vals[v-1].c_str());
         util::wprint("\n");
+        fs::remove(vals[v-1]);
     }
 }
 
 /* *************************************************************** */
-void prompt_delete(const std::vector<fs::path> &vals) {
-    if (!check::delete_()) return;
-    if (vals.size() < 2) return;
-
-    // TODO: should ignore sameline options
-    // TODO: exit if a pipe was redirected
-
-//    const bool win32 = (sizeof(fs::path::value_type) == 2);
-//    size_t len = std::count(vals.begin(), vals.end(), [](auto){ return 1; });
-//    if (win32) {
-//        util::wprint(L"Select which file to keep (all/1/2,3/none):\n");
-//    }
-
-//    if (win32) util::wprint(L"\n"); else util::wprint("\n");
-}
-
-/* *************************************************************** */
-void _print_res_tty(){
-    // windows boilerplate
-    const bool win32 = (sizeof(fs::path::value_type) == 2);
+void _print_res_normal() {
     for (const auto &[k,vals] : byfinal2) {
         const uint64_t flen = k.first, fhash = k.second;
         if ((fhash == 0) && (flen != 0)) continue;   // ignore invalid hash
+
         if (check::size_show()) {
-            if (win32) {
-                if (!check::human()) {
-                    util::wprint(L"%llu", flen);
-                } else {
-                    std::string xdiv = util::xdivn(flen, 1024);
-                    std::wstring wxdiv { xdiv.begin(), xdiv.end() };
-                    util::wprint(wxdiv.c_str());
-                }
-                util::wprint((check::sameline())? L" " : L"\n");
-            } else {
-                if (!check::human()) util::wprint("%llu", flen);
-                else util::wprint(util::xdivn(flen, 1024).c_str());
-                util::wprint((check::sameline())? " " : "\n");
-            }
+            util::wprint("%s%s", ((!check::human())?
+                    std::to_string(flen) : util::xdivn(flen, 1024)).c_str(),
+                    (check::sameline())? " " : "\n");
         }
         for (const auto &p : vals) {
-            if (win32) util::wprint(L"\""); else util::wprint("\"");
-            util::wprint(((check::abspath())? fs::canonical(p) : p).c_str());
-            if (win32) {
-                util::wprint(L"\"");
-                util::wprint((check::sameline())? L" " : L"\n");
-            } else {
-                util::wprint("\"");
-                util::wprint((check::sameline())? " " : "\n");
-            }
+            auto path = (check::abspath())? fs::canonical(p) : p;
+            util::wprint("\"%s\"", path.string().c_str());
+            util::wprint("%s", (check::sameline())? " " : "\n");
         }
-        if (win32) util::wprint(L"\n"); else util::wprint("\n");
         prompt_delete(vals);
+        util::wprint("\n");
+    }
+}
+
+void _print_res_win32() {
+    for (const auto &[k,vals] : byfinal2) {
+        const uint64_t flen = k.first, fhash = k.second;
+        if ((fhash == 0) && (flen != 0)) continue;   // ignore invalid hash
+
+        if (check::size_show()) {
+            if (!check::human()) {
+                util::wprint(L"%llu", flen);
+            } else {
+                std::string xdiv = util::xdivn(flen, 1024);
+                std::wstring wxdiv { xdiv.begin(), xdiv.end() };
+                util::wprint(wxdiv.c_str());
+            }
+            util::wprint((check::sameline())? L" " : L"\n");
+        }
+        
+        size_t count = 1;
+        for (const auto &p : vals) {
+            if (check::delete_()) {
+                util::wprint((std::to_wstring(count++)).c_str());
+                util::wprint(") ");
+            }
+            util::wprint(L"\"");
+            util::wprint(((check::abspath())? fs::canonical(p) : p).c_str());
+            util::wprint(L"\"");
+            util::wprint((check::sameline())? L" " : L"\n");
+            if (check::sameline() && check::delete_()) util::wprint(L"\n");
+        }
+        prompt_delete(vals);
+        util::wprint(L"\n");
+    }
+}
+
+/* *************************************************************** */
+void _print_res(){
+    // windows boilerplate
+    const bool win32 = (sizeof(fs::path::value_type) == 2);
+    
+    if ((win32) && (isatty(fileno(stdout)))) {
+        if (byfinal2.size() > 0) util::print("\n");
+        _print_res_win32();
+    } else {
+        _print_res_normal();
     }
 }
 
 /* *************************************************************** */
 int process() {
     auto tstart = hrclock::now();
-    for (const auto &dir : dirlist) {
-        build(dir);
-        _rputs("indexed", count.byname, count.flen_byname);
-        calc(bysize, byhash2);
-        _rputs("hashed", count.bysize, count.flen_byhash);
-        filter(byhash2, byfinal2);
-        _rputs("filtered", count.byhash, count.flen_byfilter);
-    }
-    _print_timespent(tstart);
-    util::print("\n");  // additional std::cerr separator
+    for (const auto &dir : dirlist) build(dir);
+    _rputs("indexed", count.byname, count.flen_byname);
+    calc(bysize, byhash2);
+    _rputs("hashed", count.bysize, count.flen_byhash);
+    filter(byhash2, byfinal2);
+    _rputs("filtered", count.byhash, count.flen_byfilter);
     
-    // check the pipe redirection / direct console output
-    if (isatty(fileno(stdout))) {
-        _print_res_tty();
-    } else {
-        _print_res_file();
+    if (!check::summary()) {
+        _print_timespent(tstart);
+        _print_res();
     }
     return (check::unix())? ERR_OK : static_cast<int>(count.byhash);
 }
@@ -790,6 +843,7 @@ int process() {
 /*                    PROGRAM MAIN ENTRY POINT                     */
 /* *************************************************************** */
 int main(int argc, char *argv[]) {
+//    return filelist::test();
     opts::init();
     opts::parse(argc, argv);
     filelist::load(opts::dirs);
